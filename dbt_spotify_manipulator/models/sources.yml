@@ -1,0 +1,9 @@
+version: 2
+
+sources:
+  - name: landing
+    catalog: minio
+    schema: landing
+    tables:
+      - name: spotify_recommend_tracks_happy
+      - name: spotify_recommend_tracks_sad
