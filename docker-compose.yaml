@@ -1,6 +1,7 @@
-version: '3.7'
+version: "3.7"
 
 services:
+  # storage service (s3-like)
   minio:
     image: minio/minio
     container_name: minio
@@ -13,7 +14,8 @@ services:
     command: server /data --console-address ":9001"
     volumes:
       - minio-data:/data
-  
+
+  # command line for minio
   minio-mc:
     image: minio/mc:latest
     container_name: minio-mc
@@ -21,14 +23,15 @@ services:
       - minio
     entrypoint: |
       sh -c "
-      sleep 10 &&
+      sleep 20 &&
       mc alias set myminio http://minio:9000 minioadmin minioadmin123 &&
       mc mb myminio/landing &&
       mc mb myminio/bronze &&
       mc mb myminio/silver &&
       mc mb myminio/gold
       "
-  
+
+  # database for airflow metadata storage
   postgres-airflow:
     image: postgres:13
     container_name: postgres-airflow
@@ -41,19 +44,21 @@ services:
     ports:
       - "5432:5432"
 
+  # pipeline orchestration service
   airflow:
     build:
-      context: .
-      dockerfile: configuration/airflow/airflow.Dockerfile
+      context: spotify_dataflow/
+      dockerfile: spotify_dataflow/configuration/airflow/airflow.Dockerfile
     container_name: airflow
     depends_on:
       - minio
       - postgres-airflow
+      - trino-init
     environment:
       AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow/airflow
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
       AIRFLOW__CORE__PLUGINS_FOLDER: /opt/airflow/plugins
       AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
       MINIO_ENDPOINT: http://minio:9000
@@ -61,13 +66,16 @@ services:
       MINIO_SECRET_KEY: minioadmin123
       SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID}
       SPOTIFY_SECRET: ${SPOTIFY_SECRET}
-    command: ['airflow', 'standalone']
+    command: ["airflow", "standalone"]
     ports:
       - "8080:8080"
-    volumes:
-      - ./airflow/dags:/opt/airflow/dags
-      - ./dbt_spotify_manipulator:/opt/airflow/dbt_spotify_manipulator
-  
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # query engine main service
   trino-coordinator:
     container_name: trino
     image: trinodb/trino:latest
@@ -79,7 +87,12 @@ services:
     depends_on:
       - minio-mc
     volumes:
-      - ./configuration/trino:/etc/trino
+      - ./spotify_dataflow/spotify_dataflow/configuration/trino:/etc/trino
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/v1/info"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
 
   trino-worker:
     image: trinodb/trino:latest
@@ -89,19 +102,30 @@ services:
       - TRINO_ENVIRONMENT=production
       - TRINO_DISCOVERY_URI=http://trino-coordinator:8090
     depends_on:
-      - trino-coordinator
+      trino-coordinator:
+        condition: service_healthy
     volumes:
-      - ./configuration/trino:/etc/trino
-  
+      - ./spotify_dataflow/spotify_dataflow/configuration/trino:/etc/trino
+
+  # initialize trino schemas
   trino-init:
     image: trinodb/trino:latest
     container_name: trino-initializer
     depends_on:
-      - trino-worker
-    entrypoint: [ "/bin/sh", "-c", "sleep 60 && trino --server trino-coordinator:8090 -f /docker-entrypoint-initdb.d/create_schemas.sql" ]
+      trino-coordinator:
+        condition: service_healthy
+      hive-metastore: 
+        condition: service_healthy
+    entrypoint:
+      [
+        "/bin/sh",
+        "-c",
+        "sleep 30 && trino --server trino-coordinator:8090 -f /docker-entrypoint-initdb.d/create_schemas.sql",
+      ]
     volumes:
-      - ./configuration/trino/create_schemas.sql:/docker-entrypoint-initdb.d/create_schemas.sql  
+      - ./spotify_dataflow/spotify_dataflow/configuration/trino/create_schemas.sql:/docker-entrypoint-initdb.d/create_schemas.sql
 
+  # database for hive metastore
   mariadb:
     container_name: mariadb
     hostname: mariadb
@@ -113,22 +137,71 @@ services:
       - MYSQL_USER=admin
       - MYSQL_PASSWORD=admin
       - MYSQL_DATABASE=metastore_db
-  
+
+  # hive metastore service used by trino
   hive-metastore:
     container_name: hive-metastore
     hostname: hive-metastore
-    image: 'bitsondatadev/hive-metastore:latest'
+    image: "bitsondatadev/hive-metastore:latest"
     ports:
       - 9083:9083 # Metastore Thrift
     volumes:
-      - ./configuration/hive/metastore-site.xml:/opt/apache-hive-metastore-3.0.0-bin/conf/metastore-site.xml:ro
+      - ./spotify_dataflow/spotify_dataflow/configuration/hive/metastore-site.xml:/opt/apache-hive-metastore-3.0.0-bin/conf/metastore-site.xml:ro
     environment:
       - METASTORE_DB_HOSTNAME=mariadb
     depends_on:
       - mariadb
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9083"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # make it possible to use docker inside airflow
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.1.1
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      AUTH: 1
+      POST: 1
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: always
+
+  # ml experiment tracking service
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: mlflow
+    ports:
+      - "5000:5000"
+    environment:
+      MLFLOW_TRACKING_URI: "http://mlflow:5000"
+    command: >
+      mlflow server 
+      --backend-store-uri 
+      sqlite:///mlflow.db 
+      --serve-artifacts
+      --artifacts-destination /data/artifacts
+      --host 0.0.0.0
+      --port 5000
+
+  # ml model serving
+  spotify-model-serving:
+    build: 
+      context: ./spotify_song_genre_predictor/spotify_genre_serving/
+      dockerfile: Dockerfile
+    container_name: spotify-model-serving
+    image: spotify-model-serving:latest
+    ports:
+      - "8000:8000"
+    environment:
+      MLFLOW_TRACKING_URI: "http://mlflow:5000"
+    depends_on:
+      - mlflow
 
 volumes:
   postgres_data:
     name: postgres_volume
   minio-data:
-  

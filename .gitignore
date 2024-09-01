@@ -1,0 +1,7 @@
+logs/*
+*__pycache__*
+*.local*
+.env
+*.tar.gz
+*.pkl
+*.log

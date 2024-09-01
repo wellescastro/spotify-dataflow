@@ -1,0 +1,3 @@
+spotify_dataflow/transformation/**
+spotify_dataflow/utils/**
+spotify_dataflow/configuration/**
